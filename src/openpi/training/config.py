@@ -558,6 +558,109 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    # RoboTwin place_block_aba_grid. The dataset is a locally-created LeRobot
+    # dataset (see examples/robotwin/convert_robotwin_data_to_lerobot.py).
+    # RoboTwin provides absolute 14-D joint targets, so LeRobotAlohaDataConfig
+    # converts arm joints to deltas while preserving gripper targets.
+    TrainConfig(
+        name="pi05_robotwin_place_block_aba_grid_lora",
+        project_name="robotwin-pi05-finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/robotwin_place_block_aba_grid",
+            assets=AssetsConfig(
+                assets_dir="/home/ubuntu/Workspace/openpi/outputs/robotwin_place_block_aba_grid/assets/pi05_robotwin_place_block_aba_grid_lora"
+            ),
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/ubuntu/Model/pi05_base/params"),
+        assets_base_dir="/home/ubuntu/Workspace/openpi/outputs/robotwin_place_block_aba_grid/assets",
+        checkpoint_base_dir="/home/ubuntu/Workspace/openpi/outputs/robotwin_place_block_aba_grid/checkpoints",
+        batch_size=16,
+        num_workers=4,
+        num_train_steps=30_000,
+        log_interval=20,
+        save_interval=1_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+        policy_metadata={"robotwin_task": "place_block_aba_grid", "action_dim": 14},
+    ),
+    # Deliberately separate smoke-test config. It exercises the same model,
+    # loader, local base weights, two-GPU FSDP, W&B, and checkpoint path.
+    TrainConfig(
+        name="pi05_robotwin_place_block_aba_grid_lora_smoke",
+        project_name="robotwin-pi05-finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/robotwin_place_block_aba_grid",
+            assets=AssetsConfig(
+                assets_dir="/home/ubuntu/Workspace/openpi/outputs/robotwin_place_block_aba_grid/assets/pi05_robotwin_place_block_aba_grid_lora"
+            ),
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/ubuntu/Model/pi05_base/params"),
+        assets_base_dir="/home/ubuntu/Workspace/openpi/outputs/robotwin_place_block_aba_grid/assets",
+        checkpoint_base_dir="/home/ubuntu/Workspace/openpi/outputs/robotwin_place_block_aba_grid/checkpoints",
+        batch_size=16,
+        num_workers=4,
+        num_train_steps=2,
+        log_interval=1,
+        save_interval=1,
+        fsdp_devices=2,
+        policy_metadata={"robotwin_task": "place_block_aba_grid", "action_dim": 14},
+    ),
     #
     # Inference Aloha configs.
     #
