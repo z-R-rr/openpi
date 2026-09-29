@@ -102,3 +102,21 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
             result[k] = flat_ref[k]
 
     return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+@dataclasses.dataclass(frozen=True)
+class RTCCheckpointWeightLoader(CheckpointWeightLoader):
+    """Reject silently dropping existing adapters when loading a task/RTC checkpoint."""
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        reference_keys = set(flax.traverse_util.flatten_dict(params, sep="/"))
+        extra_adapters = [
+            k for k in flax.traverse_util.flatten_dict(loaded, sep="/") if "lora" in k and k not in reference_keys
+        ]
+        if extra_adapters:
+            raise ValueError(
+                "Base checkpoint contains adapters absent from model config. Preserve them with the matching "
+                f"LoRA variant (VLM adapters will stay frozen). Examples: {extra_adapters[:3]}"
+            )
+        return _merge_params(loaded, params, missing_regex=".*lora.*")

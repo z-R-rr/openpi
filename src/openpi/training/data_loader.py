@@ -127,6 +127,38 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class RTCLeRobotDataset(lerobot_dataset.LeRobotDataset):
+    """Pinned LeRobot v2.1 indexes compact episode bounds by original episode ID.
+
+    A split such as [2, 5] has only two rows of episode bounds; remap ONLY the
+    query-bound lookup. Keep original IDs for task metadata and video paths.
+    """
+
+    def _get_query_indices(self, idx, ep_idx):
+        if self.episodes is not None:
+            ep_idx = self.episodes.index(ep_idx)
+        return super()._get_query_indices(idx, ep_idx)
+
+
+def rtc_validation_indices(lengths, count):
+    """Fixed round-robin episode/time coverage instead of the first video's first frames."""
+    if not lengths or any(length <= 0 for length in lengths) or not 0 < count <= sum(lengths):
+        raise ValueError("Invalid validation lengths or sample count")
+    allocations = [0] * len(lengths)
+    remaining = count
+    while remaining:
+        for episode, length in enumerate(lengths):
+            if allocations[episode] < length and remaining:
+                allocations[episode] += 1
+                remaining -= 1
+    offsets = np.cumsum([0, *lengths[:-1]])
+    per_episode = [
+        (offset + np.linspace(0, length - 1, num=n, dtype=np.int64)).tolist()
+        for offset, length, n in zip(offsets, lengths, allocations, strict=True)
+    ]
+    return [values[i] for i in range(max(allocations)) for values in per_episode if i < len(values)]
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -138,8 +170,12 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    if data_config.rtc_split is not None and data_config.episodes is None:
+        raise ValueError("RTC episode split must be resolved before constructing the dataset")
+    dataset_cls = RTCLeRobotDataset if data_config.rtc_split is not None else lerobot_dataset.LeRobotDataset
+    dataset = dataset_cls(
         data_config.repo_id,
+        episodes=list(data_config.episodes) if data_config.episodes is not None else None,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -240,6 +276,7 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    data_config = resolve_rtc_episodes(data_config)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
@@ -321,6 +358,17 @@ def create_torch_data_loader(
     else:
         local_batch_size = batch_size // jax.process_count()
 
+    if data_config.rtc_split == "validation":
+        # Official loader loops indefinitely. Never repeat validation examples to
+        # satisfy an oversized requested batch budget; a final partial batch is dropped.
+        available = len(dataset) // local_batch_size
+        if available < 1:
+            raise ValueError("RTC validation split is smaller than batch_size; reduce batch_size")
+        num_batches = available if num_batches is None else min(num_batches, available)
+        metadata = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+        lengths = [metadata.episodes[i]["length"] for i in data_config.episodes]
+        sampler = rtc_validation_indices(lengths, num_batches * local_batch_size)
+        logging.info("RTC validation covers %s episodes with %s fixed frame indices", len(lengths), len(sampler))
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
         dataset,
@@ -538,3 +586,19 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+def resolve_rtc_episodes(data_config):
+    if data_config.rtc_split is None or data_config.episodes is not None:
+        return data_config
+    import dataclasses
+
+    total = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id).total_episodes
+    train_ids, val_ids = _config.rtc_episode_split(
+        total,
+        data_config.rtc_validation_fraction,
+        data_config.rtc_split_seed,
+        train_episodes=data_config.rtc_train_episodes,
+        validation_episodes=data_config.rtc_validation_episodes,
+    )
+    return dataclasses.replace(data_config, episodes=train_ids if data_config.rtc_split == "train" else val_ids)

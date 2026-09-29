@@ -45,16 +45,29 @@ def create_trained_policy(
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
+    rtc_provenance = None
+    if getattr(train_config.model, "simulated_delay", None) is not None:
+        from openpi.training import rtc_manifest
+
+        rtc_provenance = rtc_manifest.read(checkpoint_dir)
+        train_config = rtc_manifest.restore_config(train_config, rtc_provenance, checkpoint_dir)
+
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
 
+    rtc_enabled = getattr(train_config.model, "simulated_delay", None) is not None
+    if rtc_enabled and is_pytorch:
+        raise ValueError("Training RTC only supports JAX checkpoints")
     logging.info("Loading model...")
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        # Preserve trainable FP32 RTC parameters for consistent online/offline validation.
+        model = train_config.model.load(
+            _model.restore_params(checkpoint_dir / "params", dtype=None if rtc_enabled else jnp.bfloat16)
+        )
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
@@ -72,8 +85,27 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    policy_cls = _policy.Policy
+    extra_kwargs = {}
+    if rtc_enabled:
+        from openpi.policies.rtc_policy import TrainingRTCPolicy
+
+        if data_config.rtc_raw_action_dim is None or data_config.rtc_delta_mask is None:
+            raise ValueError("RTC requires an explicit delta data configuration")
+        if norm_stats is None or "actions" not in norm_stats or "state" not in norm_stats:
+            raise ValueError("RTC requires checkpoint action and state normalization statistics")
+        if repack_transforms.inputs or repack_transforms.outputs:
+            raise ValueError("RTC wire observations must already use canonical state/images keys")
+        if rtc_manifest.stats_digest(norm_stats) != rtc_provenance["norm_stats_sha256"]:
+            raise ValueError("RTC normalization statistics do not match checkpoint provenance")
+        if list(data_config.rtc_delta_mask) != rtc_provenance["delta_mask"]:
+            raise ValueError("RTC delta convention differs from training")
+        policy_cls = TrainingRTCPolicy
+        extra_kwargs["raw_action_dim"] = data_config.rtc_raw_action_dim
+
+    return policy_cls(
         model,
+        **extra_kwargs,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
@@ -88,7 +120,18 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata={
+            **train_config.policy_metadata,
+            **(
+                {
+                    "action_horizon": train_config.model.action_horizon,
+                    "simulated_delay": train_config.model.simulated_delay,
+                    "raw_action_dim": data_config.rtc_raw_action_dim,
+                }
+                if rtc_enabled
+                else {}
+            ),
+        },
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )

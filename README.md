@@ -1,3 +1,5 @@
+> **JAX π0.5 Training RTC：全量微调（2 × H20 96 GB）与动作侧 LoRA。** 实现和运行说明见 [TRAINING_RTC.md](TRAINING_RTC.md)，新机器使用步骤见 [H20 全量微调指南](docs/training_rtc_full_h20.md)。以下保留上游 OpenPI README。
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).

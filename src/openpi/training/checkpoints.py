@@ -55,7 +55,8 @@ def initialize_checkpoint_dir(
     # Special case: the checkpoint directory exists and the user requests to resume training, but the training run did
     # not get to the first checkpoint saved. In this case, we don't actually want the train script to try and restore a
     # checkpoint, since it will fail.
-    if resuming and tuple(mngr.all_steps()) in [(), (0,)]:
+    # Step zero is a valid committed checkpoint (e.g. a one-update smoke run).
+    if resuming and not tuple(mngr.all_steps()):
         logging.info("Checkpoint directory exists, but does not contain any checkpoints. Aborting resume.")
         resuming = False
 
@@ -67,6 +68,8 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    rtc_manifest: dict | None = None,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -74,6 +77,10 @@ def save_state(
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        if rtc_manifest is not None:
+            import json
+
+            (directory / "rtc_manifest.json").write_text(json.dumps(rtc_manifest, indent=2))
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

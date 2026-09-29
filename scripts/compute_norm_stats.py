@@ -88,6 +88,15 @@ def create_rlds_dataloader(
 
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
+    if isinstance(config.data, _config.LeRobotPiperRTCDataConfig):
+        if max_frames is not None:
+            raise ValueError(
+                "RTC stats use complete training episodes; use compute_rtc_norm_stats.py for a limited smoke"
+            )
+        from openpi.training.rtc_norm_stats import compute
+
+        compute(config)
+        return
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:

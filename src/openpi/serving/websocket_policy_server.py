@@ -41,6 +41,8 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # First JAX compilation can exceed the default 20 second keepalive.
+            ping_timeout=120,
             process_request=_health_check,
         ) as server:
             await server.serve_forever()

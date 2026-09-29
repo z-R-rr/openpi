@@ -192,6 +192,7 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
+    config = _config.resolve_rtc_training_config(config)
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -222,6 +223,30 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=True,
     )
+    rtc_provenance = None
+    validation_loader = None
+    if getattr(config.model, "simulated_delay", None) is not None:
+        import json
+
+        from openpi.training import rtc_manifest
+        from openpi.training import rtc_validation
+
+        rtc_provenance = rtc_manifest.build(config, data_loader.data_config())
+        provenance_path = config.checkpoint_dir / "rtc_manifest.json"
+        if resuming and not provenance_path.exists():
+            raise ValueError("RTC resume requires the original rtc_manifest.json")
+        if resuming:
+            previous = json.loads(provenance_path.read_text())
+            if previous != rtc_provenance:
+                raise ValueError("RTC config/data/provenance changed during resume; start a new experiment")
+        provenance_path.write_text(json.dumps(rtc_provenance, indent=2))
+        if config.rtc_validation_interval > 0:
+            val_config = dataclasses.replace(config, data=dataclasses.replace(config.data, split="validation"))
+            validation_loader = _data_loader.create_data_loader(
+                val_config, sharding=data_sharding, shuffle=False, num_batches=config.rtc_validation_batches
+            )
+            if set(data_loader.data_config().episodes) & set(validation_loader.data_config().episodes):
+                raise ValueError("RTC training/validation episode overlap")
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -247,6 +272,18 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    validation_fn = None
+    if validation_loader is not None:
+        validation_fn = jax.jit(
+            functools.partial(
+                rtc_validation.state_batch_sums,
+                train_state.model_def,
+                raw_action_dim=data_loader.data_config().rtc_raw_action_dim,
+            ),
+            in_shardings=(train_state_sharding.params, replicated_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -269,8 +306,26 @@ def main(config: _config.TrainConfig):
             infos = []
         batch = next(data_iter)
 
+        if validation_fn is not None and (
+            (step + 1) % config.rtc_validation_interval == 0 or step == config.num_train_steps - 1
+        ):
+            with sharding.set_mesh(mesh):
+                metrics = rtc_validation.evaluate_batches(
+                    functools.partial(validation_fn, train_state.params),
+                    validation_loader,
+                    seed=config.seed,
+                    num_batches=config.rtc_validation_batches,
+                    raw_action_dim=data_loader.data_config().rtc_raw_action_dim,
+                    model_action_dim=config.model.action_dim,
+                    reduction=config.model.rtc_loss_reduction,
+                )
+            logging.info("RTC validation: %s", metrics)
+            wandb.log({k: v for k, v in metrics.items() if v is not None}, step=step)
+            with (config.checkpoint_dir / "rtc_validation.jsonl").open("a") as f:
+                f.write(json.dumps({"step": step, **metrics}) + "\n")
+
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, rtc_manifest=rtc_provenance)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

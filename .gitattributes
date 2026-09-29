@@ -1,0 +1,2 @@
+# Unified patches need the leading context marker on otherwise empty lines.
+provenance/*.patch -whitespace

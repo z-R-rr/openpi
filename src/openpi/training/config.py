@@ -5,11 +5,13 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import math
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -17,6 +19,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+from openpi.policies import piper_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
@@ -89,6 +92,16 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Optional fixed episode split, used by RTC training and validation.
+    episodes: tuple[int, ...] | None = None
+    rtc_split: Literal["train", "validation"] | None = None
+    rtc_validation_fraction: float = 0.1
+    rtc_split_seed: int = 42
+    rtc_train_episodes: tuple[int, ...] | None = None
+    rtc_validation_episodes: tuple[int, ...] | None = None
+    rtc_raw_action_dim: int | None = None
+    rtc_delta_mask: tuple[bool, ...] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -275,6 +288,86 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+def rtc_episode_split(
+    total: int,
+    fraction: float,
+    seed: int,
+    *,
+    train_episodes: tuple[int, ...] | None = None,
+    validation_episodes: tuple[int, ...] | None = None,
+):
+    if train_episodes is not None or validation_episodes is not None:
+        if train_episodes is None or validation_episodes is None:
+            raise ValueError("Explicit split requires both train and validation episode lists")
+        for ids in (train_episodes, validation_episodes):
+            if not ids or any(type(i) is not int or not 0 <= i < total for i in ids):
+                raise ValueError("Explicit episode IDs must be nonempty integer lists in dataset range")
+            if len(ids) != len(set(ids)):
+                raise ValueError("Duplicate episode IDs in explicit split")
+        if set(train_episodes) & set(validation_episodes):
+            raise ValueError("Training and validation episodes overlap")
+        if set(train_episodes) | set(validation_episodes) != set(range(total)):
+            raise ValueError("Explicit split must cover all episodes")
+        return tuple(sorted(train_episodes)), tuple(sorted(validation_episodes))
+    if total < 2 or not 0 < fraction < 1:
+        raise ValueError("RTC requires at least two episodes and a validation fraction in (0,1)")
+    ids = np.random.default_rng(seed).permutation(total)
+    count = min(total - 1, max(1, math.ceil(total * fraction)))
+    return tuple(sorted(ids[count:].tolist())), tuple(sorted(ids[:count].tolist()))
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperRTCDataConfig(DataConfigFactory):
+    """Raw absolute 7D Piper commands -> current-state all-delta -> checkpoint normalization."""
+
+    action_sequence_keys: tuple[str, ...] = ("action",)
+    validation_fraction: float = 0.1
+    split_seed: int = 42
+    train_episodes: tuple[int, ...] | None = None
+    validation_episodes: tuple[int, ...] | None = None
+    split: Literal["train", "validation"] = "train"
+
+    @override
+    def create(self, assets_dirs, model_config):
+        if not isinstance(model_config, pi0_config.Pi0Config) or not model_config.pi05:
+            raise ValueError("Piper RTC requires pi05")
+        if model_config.action_dim < 7:
+            raise ValueError("Piper RTC model action_dim must be at least 7")
+        mask = (True,) * 7  # Includes gripper; must match the task base checkpoint.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "top_head": "observation.images.top_head",
+                                "hand_right": "observation.images.hand_right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                            "action_is_pad": "action_is_pad",
+                        }
+                    )
+                ]
+            ),
+            data_transforms=_transforms.Group(
+                inputs=[piper_policy.PiperInputs(), _transforms.DeltaActions(mask)],
+                outputs=[_transforms.AbsoluteActions(mask), piper_policy.PiperOutputs()],
+            ),
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+            rtc_split=self.split,
+            rtc_validation_fraction=self.validation_fraction,
+            rtc_split_seed=self.split_seed,
+            rtc_train_episodes=self.train_episodes,
+            rtc_validation_episodes=self.validation_episodes,
+            rtc_raw_action_dim=7,
+            rtc_delta_mask=mask,
         )
 
 
@@ -488,6 +581,8 @@ class TrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
+    rtc_validation_interval: int = 0
+    rtc_validation_batches: int = 4
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -556,8 +651,76 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def resolve_rtc_training_config(config: TrainConfig) -> TrainConfig:
+    """Apply RTC freeze/optimizer rules after CLI overrides, for both supported modes."""
+    if getattr(config.model, "simulated_delay", None) is None:
+        return config
+    if config.model.rtc_finetune_mode == "full":
+        if not isinstance(config.optimizer, _optimizer.AdamW) or isinstance(config.optimizer, _optimizer.RTCAdamW):
+            raise ValueError("Full RTC training requires AdamW with one learning rate for all parameters")
+    elif not isinstance(config.optimizer, _optimizer.RTCAdamW):
+        raise ValueError("RTC LoRA training requires the explicit two-rate RTCAdamW optimizer")
+    if config.ema_decay is not None:
+        raise ValueError("This RTC setup validates/saves current parameters; set ema_decay=None")
+    return dataclasses.replace(config, freeze_filter=config.model.get_rtc_freeze_filter())
+
+
 # Use `get_config` if you need to get a config by name in your code.
+_RTC_MODEL = pi0_config.Pi0Config(
+    pi05=True,
+    action_dim=32,
+    action_horizon=30,
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora",
+    simulated_delay=5,
+    pytorch_compile_mode=None,
+    rtc_loss_reduction="official",
+    rtc_time_distribution="beta",
+)
+
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_piper_training_rtc_lora",
+        project_name="pi05-training-rtc",
+        model=_RTC_MODEL,
+        data=LeRobotPiperRTCDataConfig(
+            repo_id="/home/ubuntu/dataset/recognize_four_book_lerobot_v21_processed",
+            assets=AssetsConfig(
+                assets_dir="/home/ubuntu/Model/pi05-piper-recognize-fourbook-fullft-bs64-5000/assets",
+                asset_id="piper_recognize_four_book_all_delta",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=_RTC_MODEL.get_rtc_freeze_filter(),
+        weight_loader=weight_loaders.RTCCheckpointWeightLoader(
+            "/home/ubuntu/Model/pi05-piper-recognize-fourbook-fullft-bs64-5000/params"
+        ),
+        optimizer=_optimizer.RTCAdamW(inherited_lr_scale=0.2),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500, peak_lr=2.5e-5, decay_steps=10_000, decay_lr=2.5e-6
+        ),
+        assets_base_dir="./assets",
+        checkpoint_base_dir="./checkpoints",
+        batch_size=16,
+        num_workers=4,
+        fsdp_devices=1,
+        num_train_steps=10_000,
+        log_interval=20,
+        save_interval=1_000,
+        keep_period=5_000,
+        seed=42,
+        wandb_enabled=False,
+        ema_decay=None,
+        rtc_validation_interval=1_000,
+        policy_metadata={
+            "training_rtc": True,
+            "wire_action_space": "absolute",
+            "model_action_space": "delta",
+            "raw_action_dim": 7,
+            "action_horizon": 30,
+            "simulated_delay": 5,
+        },
+    ),
     #
     # Inference Aloha configs.
     #
@@ -969,6 +1132,103 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+# Banana starts from official pi05_base and uses newly computed training-only stats.
+# Keep the original task-adaptation recipe available as its own named experiment.
+_rtc_template = next(c for c in _CONFIGS if c.name == "pi05_piper_training_rtc_lora")
+_CONFIGS.append(
+    dataclasses.replace(
+        _rtc_template,
+        name="pi05_piper_banana_training_rtc_lora",
+        project_name="pi05-banana-training-rtc",
+        data=dataclasses.replace(
+            _rtc_template.data,
+            repo_id="/home/ubuntu/Data/banana",
+            # Snapshot of configs/banana_train_validation.json; never silently reshuffle.
+            train_episodes=(
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                29,
+                30,
+                31,
+                32,
+                33,
+                34,
+                36,
+                37,
+                38,
+                39,
+                40,
+                41,
+                43,
+                44,
+                45,
+                46,
+                47,
+                48,
+                49,
+                50,
+            ),
+            validation_episodes=(7, 14, 21, 28, 35, 42),
+            assets=AssetsConfig(
+                assets_dir=str(
+                    pathlib.Path(__file__).resolve().parents[3] / "assets" / "pi05_piper_banana_training_rtc_lora"
+                ),
+                asset_id="piper_banana_all_delta_h30_val_7_14_21_28_35_42",
+            ),
+        ),
+        weight_loader=weight_loaders.RTCCheckpointWeightLoader("/home/ubuntu/Data/pi05_base/params"),
+        policy_metadata={**_rtc_template.policy_metadata, "task": "banana"},
+    )
+)
+
+# Full fine-tuning is a separate experiment from the same official base and data.
+# Statistics depend on the delta convention/split/horizon, not the freeze strategy.
+_banana_rtc_lora = next(c for c in _CONFIGS if c.name == "pi05_piper_banana_training_rtc_lora")
+_banana_rtc_full_model = dataclasses.replace(
+    _banana_rtc_lora.model,
+    action_expert_variant="gemma_300m",
+    rtc_finetune_mode="full",
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _banana_rtc_lora,
+        name="pi05_piper_banana_training_rtc_full",
+        model=_banana_rtc_full_model,
+        freeze_filter=_banana_rtc_full_model.get_rtc_freeze_filter(),
+        optimizer=_optimizer.AdamW(),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=1e-5, decay_steps=10_000, decay_lr=1e-6),
+        # Target hardware: two H20 96 GB GPUs; global batch 16, eight per GPU.
+        batch_size=16,
+        fsdp_devices=2,
+        # Same 64 fixed validation anchors and batching as the LoRA experiment.
+        rtc_validation_batches=4,
+        policy_metadata={**_banana_rtc_lora.policy_metadata, "finetune_mode": "full"},
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
